@@ -380,7 +380,6 @@ static int dvb_dmxdev_section_callback(const u8 *buffer1, size_t buffer1_len,
 					      buffer2_len);
 	}
 	if (ret < 0) {
-		dvb_ringbuffer_flush(&dmxdevfilter->buffer);
 		dmxdevfilter->buffer.error = ret;
 	}
 	if (dmxdevfilter->params.sec.flags & DMX_ONESHOT)
@@ -410,7 +409,74 @@ static int dvb_dmxdev_ts_callback(const u8 *buffer1, size_t buffer1_len,
 		buffer = &dmxdevfilter->buffer;
 	else
 		buffer = &dmxdevfilter->dev->dvr_buffer;
-	if (buffer->error) {
+		events = &dmxdevfilter->dev->dvr_output_events;
+	}
+
+	if (dmx_data_ready->status == DMX_OK_PCR) {
+		dprintk("dmxdev: event callback DMX_OK_PCR\n");
+		event.type = DMX_EVENT_NEW_PCR;
+		event.params.pcr.pcr = dmx_data_ready->pcr.pcr;
+		event.params.pcr.stc = dmx_data_ready->pcr.stc;
+		if (dmx_data_ready->pcr.disc_indicator_set)
+			event.params.pcr.flags =
+				DMX_FILTER_DISCONTINUITY_INDICATOR;
+		else
+			event.params.pcr.flags = 0;
+
+		dvb_dmxdev_add_event(events, &event);
+		spin_unlock(&dmxdevfilter->dev->lock);
+		wake_up_all(&buffer->queue);
+		return 0;
+	}
+
+	if (dmx_data_ready->status == DMX_OK_DECODER_BUF) {
+		event.type = DMX_EVENT_NEW_ES_DATA;
+		event.params.es_data.buf_handle = dmx_data_ready->buf.handle;
+		event.params.es_data.cookie = dmx_data_ready->buf.cookie;
+		event.params.es_data.offset = dmx_data_ready->buf.offset;
+		event.params.es_data.data_len = dmx_data_ready->buf.len;
+		event.params.es_data.pts_valid = dmx_data_ready->buf.pts_exists;
+		event.params.es_data.pts = dmx_data_ready->buf.pts;
+		event.params.es_data.dts_valid = dmx_data_ready->buf.dts_exists;
+		event.params.es_data.dts = dmx_data_ready->buf.dts;
+		event.params.es_data.transport_error_indicator_counter =
+				dmx_data_ready->buf.tei_counter;
+		event.params.es_data.continuity_error_counter =
+				dmx_data_ready->buf.cont_err_counter;
+		event.params.es_data.ts_packets_num =
+				dmx_data_ready->buf.ts_packets_num;
+		event.params.es_data.ts_dropped_bytes =
+				dmx_data_ready->buf.ts_dropped_bytes;
+		dvb_dmxdev_add_event(events, &event);
+		spin_unlock(&dmxdevfilter->dev->lock);
+		wake_up_all(&buffer->queue);
+		return 0;
+	}
+
+	if ((dmxdevfilter->params.pes.output == DMX_OUT_DECODER) ||
+		(buffer->error)) {
+		spin_unlock(&dmxdevfilter->dev->lock);
+		wake_up_all(&buffer->queue);
+		return 0;
+	}
+
+	free = dvb_ringbuffer_free(&dmxdevfilter->buffer);
+
+	if ((DMX_OVERRUN_ERROR == dmx_data_ready->status) ||
+		(dmx_data_ready->data_length > free)) {
+
+		/*
+		 * Enter buffer overflow state:
+		 * Set buffer overflow error state, flush all pending demux
+		 * device events to ensure user can receive the overflow event
+		 * and report the event to user
+		 */
+		dprintk("dmxdev: buffer overflow\n");
+
+		buffer->error = -EOVERFLOW;
+		event.type = DMX_EVENT_BUFFER_OVERFLOW;
+		dvb_dmxdev_add_event(&dmxdevfilter->events, &event);
+
 		spin_unlock(&dmxdevfilter->dev->lock);
 		wake_up(&buffer->queue);
 		return 0;
